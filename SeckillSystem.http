@@ -1,0 +1,7 @@
+@SeckillSystem_HostAddress = http://localhost:5091
+
+POST {{SeckillSystem_HostAddress}}/Seckill/
+Accept: application/json
+Content-Type: application/json
+
+###

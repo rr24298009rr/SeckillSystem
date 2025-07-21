@@ -1,0 +1,12 @@
+target/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.DS_Store
+.idea/
+.vscode/
+
+bin/
+obj/
