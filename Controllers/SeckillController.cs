@@ -19,66 +19,58 @@ public class SeckillController : ControllerBase
     }
 
     [HttpPost]
-    public async Task<IActionResult> Purchase()
+    [Route("purchase/{id}")]
+    public async Task<IActionResult> Purchase(int id)
     {
-        string key = "product_stock";
-        const int productId = 1;
-        
+        string key = $"product_{id}_stock";
+
         try
         {
-            // 先嘗試從 Redis 扣庫存（原子操作）
+            RedisValue redisValue = await _redis.StringGetAsync(key);
+
+            if (!redisValue.HasValue)
+            {
+                var product = await _dbContext.Products.FirstOrDefaultAsync(p => p.Id == id);
+                if (product == null || product.Stock <= 0)
+                {
+                    await _redis.StringSetAsync(key, 0);
+                    return BadRequest(new { message = "商品售罄" });
+                }
+
+                await _redis.StringSetAsync(key, product.Stock);
+            }
+
+            // 🧊 嘗試 Redis 原子扣庫存
             long newStock = await _redis.StringDecrementAsync(key);
-            
-            // 如果扣減後庫存為負數，表示超賣或庫存不足
+
             if (newStock < 0)
             {
-                // 回滾 Redis 操作
+                // ❗️庫存為負，立即補回（回滾），不重試扣第二次
                 await _redis.StringIncrementAsync(key);
-                
-                // 嘗試從資料庫重新載入庫存到 Redis
-                var product = await _dbContext.Products.FirstOrDefaultAsync(p => p.Id == productId);
-                if (product != null && product.Stock > 0)
-                {
-                    await _redis.StringSetAsync(key, product.Stock);
-                    // 重新嘗試扣減
-                    newStock = await _redis.StringDecrementAsync(key);
-                    if (newStock < 0)
-                    {
-                        await _redis.StringIncrementAsync(key);
-                        return BadRequest(new { message = "搶購完畢" });
-                    }
-                }
-                else
-                {
-                    // 資料庫也沒庫存，設置 Redis 為 0
-                    await _redis.StringSetAsync(key, 0);
-                    return BadRequest(new { message = "搶購完畢" });
-                }
+
+                return BadRequest(new { message = "搶購完畢" });
             }
-            
-            // Redis 扣減成功，開始資料庫事務
+
+            // ✅ Redis 庫存足夠，開始處理資料庫層
             using var transaction = await _dbContext.Database.BeginTransactionAsync();
-            
+
             try
             {
-                // 更新資料庫庫存（樂觀鎖定）
-                var product = await _dbContext.Products
-                    .FirstOrDefaultAsync(p => p.Id == productId);
-                
+                var product = await _dbContext.Products.FirstOrDefaultAsync(p => p.Id == id);
+
                 if (product == null)
                 {
                     throw new InvalidOperationException("商品不存在");
                 }
-                
+
                 if (product.Stock <= 0)
                 {
                     throw new InvalidOperationException("資料庫庫存不足");
                 }
-                
-                // 扣減資料庫庫存
+
+                // 🧮 更新資料庫庫存
                 product.Stock--;
-                //product.UpdatedAt = DateTime.Now;
-                
+
                 // TODO: 這裡應該加入訂單記錄
                 // var order = new Order 
                 // {
@@ -89,12 +81,13 @@ public class SeckillController : ControllerBase
                 //     CreatedAt = DateTime.Now
                 // };
                 // _dbContext.Orders.Add(order);
-                
+
                 await _dbContext.SaveChangesAsync();
                 await transaction.CommitAsync();
-                
-                return Ok(new { 
-                    message = "搶購成功", 
+
+                return Ok(new
+                {
+                    message = "搶購成功",
                     left = newStock,
                     dbStock = product.Stock,
                     timestamp = DateTime.Now
@@ -102,22 +95,56 @@ public class SeckillController : ControllerBase
             }
             catch (Exception dbEx)
             {
-                // 資料庫操作失敗，回滾事務和 Redis
+                // ❌ 資料庫失敗，補回 Redis 庫存
                 await transaction.RollbackAsync();
                 await _redis.StringIncrementAsync(key);
-                
-                return BadRequest(new { 
-                    message = "搶購失敗，請重試", 
-                    error = dbEx.Message 
+
+                return BadRequest(new
+                {
+                    message = "搶購失敗，請重試",
+                    error = dbEx.Message
                 });
             }
         }
         catch (Exception ex)
         {
-            // Redis 操作失敗
-            return BadRequest(new { 
-                message = "系統錯誤，請稍後再試", 
-                error = ex.Message 
+            return BadRequest(new
+            {
+                message = "系統錯誤",
+                error = ex.Message
+            });
+        }
+    }
+
+    [HttpPost]
+    [Route("reset/{id}")]
+    public async Task<IActionResult> Reset(int id)
+    {
+        string key = $"product_{id}_stock";
+
+        try
+        {
+            // 先嘗試從 Redis 清除庫存
+            var result = await _redis.KeyDeleteAsync(key);
+            // 嘗試恢復 MSSQL 庫存
+            var product = await _dbContext.Products.FirstOrDefaultAsync(p => p.Id == id);
+            if (product == null)
+            {
+                return NotFound(new { message = "商品不存在" });
+            }
+
+            // 嘗試恢復 MSSQL 庫存
+            product.Stock = int.TryParse(product.Name.Substring(5, product.Name.Length - 5), out var stock) ? stock : 0;
+            await _dbContext.SaveChangesAsync();
+
+            return Ok(new { message = "重置成功" });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new
+            {
+                message = "重置失敗",
+                error = ex.Message
             });
         }
     }
